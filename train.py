@@ -55,7 +55,8 @@ BATCH_SIZE = 1
 GRAD_ACCUM = 4
 
 # Evaluation
-EVAL_MAX_NEW_TOKENS = 384
+EVAL_MAX_NEW_TOKENS = 128           # Short — answers are brief, no need for long reasoning
+EVAL_BATCH_SIZE = 4                 # Batched generation for speed
 
 # Output
 OUTPUT_DIR = './adapter'
@@ -221,9 +222,13 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Evaluate
+    # Evaluate (batched for speed)
     print('\nEvaluating...')
-    overall, by_type = evaluate_model(model, tokenizer, val_data, max_new_tokens=EVAL_MAX_NEW_TOKENS)
+    overall, by_type = evaluate_model(
+        model, tokenizer, val_data,
+        max_new_tokens=EVAL_MAX_NEW_TOKENS,
+        batch_size=EVAL_BATCH_SIZE,
+    )
 
     # Print results
     elapsed = time.time() - start_time

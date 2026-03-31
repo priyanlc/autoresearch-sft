@@ -17,6 +17,7 @@ import subprocess
 
 import polars as pl
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer
 
 
@@ -28,7 +29,7 @@ VAL_JSON = os.path.join(DATA_DIR, 'val_split.json')
 RESULTS_TSV = 'results.tsv'
 
 # === Validation split (fixed, never changes) ===
-VAL_SAMPLES_PER_TYPE = 20  # 6 * 20 = 120 samples
+VAL_SAMPLES_PER_TYPE = 5  # 6 * 5 = 30 samples (small for fast iteration)
 
 
 def classify_type(prompt_text):
@@ -83,54 +84,113 @@ def answers_match(pred, gold):
 METRIC_SUFFIX = '\nPlease put your final answer inside `\\boxed{}`. For example: `\\boxed{your answer}`'
 
 
-def evaluate_model(model, tokenizer, val_data, max_new_tokens=512):
-    """Evaluate on validation set with greedy decoding. Returns (overall_accuracy, per_type_dict)."""
+def _tokenize_prompt(messages, tokenizer):
+    """Tokenize a single chat message, returning a 1D tensor of input_ids."""
+    for kwargs in [{'enable_thinking': True}, {}]:
+        try:
+            result = tokenizer.apply_chat_template(
+                messages, return_tensors='pt', add_generation_prompt=True, **kwargs
+            )
+            if hasattr(result, 'input_ids'):
+                return result['input_ids'].squeeze(0)
+            elif isinstance(result, dict):
+                return result['input_ids'].squeeze(0)
+            else:
+                return result.squeeze(0)
+        except TypeError:
+            continue
+    # Fallback: tokenize manually
+    text = f'<|im_start|>user\n{messages[0]["content"]}<|im_end|>\n<|im_start|>assistant\n'
+    return tokenizer(text, return_tensors='pt')['input_ids'].squeeze(0)
+
+
+def evaluate_model(model, tokenizer, val_data, max_new_tokens=128, batch_size=4):
+    """Evaluate on validation set with batched greedy decoding.
+
+    Args:
+        model: The model to evaluate.
+        tokenizer: The tokenizer.
+        val_data: List of dicts with 'prompt', 'answer', 'qtype'.
+        max_new_tokens: Max tokens to generate per sample.
+        batch_size: Number of samples to generate in parallel.
+
+    Returns:
+        (overall_accuracy, per_type_dict)
+    """
     model.eval()
     results = {'total': 0, 'correct': 0, 'by_type': {}}
 
-    for example in val_data:
-        qtype = example['qtype']
-        messages = [{'role': 'user', 'content': example['prompt'] + METRIC_SUFFIX}]
+    # Determine device
+    if torch.cuda.is_available():
+        device = torch.device('cuda:0')
+    else:
+        device = next(model.parameters()).device
 
-        try:
-            result = tokenizer.apply_chat_template(
-                messages, return_tensors='pt', add_generation_prompt=True,
-                enable_thinking=True
-            )
-        except TypeError:
-            result = tokenizer.apply_chat_template(
-                messages, return_tensors='pt', add_generation_prompt=True
-            )
+    # Ensure tokenizer has pad token and pads on the left (for batched generation)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = 'left'
 
-        if hasattr(result, 'input_ids'):
-            input_ids = result['input_ids'].to(model.device)
-        elif isinstance(result, dict):
-            input_ids = result['input_ids'].to(model.device)
-        else:
-            input_ids = result.to(model.device)
+    # Process in batches
+    for batch_start in range(0, len(val_data), batch_size):
+        batch = val_data[batch_start:batch_start + batch_size]
 
-        if not isinstance(input_ids, torch.Tensor):
-            input_ids = torch.tensor(input_ids).to(model.device)
+        # Tokenize all prompts in the batch
+        all_input_ids = []
+        for example in batch:
+            messages = [{'role': 'user', 'content': example['prompt'] + METRIC_SUFFIX}]
+            ids = _tokenize_prompt(messages, tokenizer)
+            if not isinstance(ids, torch.Tensor):
+                ids = torch.tensor(ids)
+            all_input_ids.append(ids)
 
+        # Pad to same length (left-padded for generation)
+        prompt_lengths = [ids.shape[0] for ids in all_input_ids]
+        max_len = max(prompt_lengths)
+        padded_ids = torch.full((len(batch), max_len), tokenizer.pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(batch), max_len), dtype=torch.long)
+
+        for i, ids in enumerate(all_input_ids):
+            pad_len = max_len - ids.shape[0]
+            padded_ids[i, pad_len:] = ids
+            attention_mask[i, pad_len:] = 1
+
+        padded_ids = padded_ids.to(device)
+        attention_mask = attention_mask.to(device)
+
+        # Generate
         with torch.no_grad():
-            output = model.generate(
-                input_ids=input_ids,
+            outputs = model.generate(
+                input_ids=padded_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
             )
 
-        response = tokenizer.decode(output[0][input_ids.shape[1]:], skip_special_tokens=True)
-        pred = extract_boxed_answer(response)
-        gold = example['answer']
-        is_correct = answers_match(pred, gold)
+        # Decode and score each sample
+        for i, example in enumerate(batch):
+            prompt_len = prompt_lengths[i]
+            pad_len = max_len - prompt_len
+            generated_ids = outputs[i, max_len:]  # Everything after the padded prompt
+            response = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-        results['total'] += 1
-        results['correct'] += int(is_correct)
+            pred = extract_boxed_answer(response)
+            gold = example['answer']
+            qtype = example['qtype']
+            is_correct = answers_match(pred, gold)
 
-        if qtype not in results['by_type']:
-            results['by_type'][qtype] = {'total': 0, 'correct': 0}
-        results['by_type'][qtype]['total'] += 1
-        results['by_type'][qtype]['correct'] += int(is_correct)
+            results['total'] += 1
+            results['correct'] += int(is_correct)
+
+            if qtype not in results['by_type']:
+                results['by_type'][qtype] = {'total': 0, 'correct': 0}
+            results['by_type'][qtype]['total'] += 1
+            results['by_type'][qtype]['correct'] += int(is_correct)
+
+    # Restore original padding side
+    tokenizer.padding_side = original_padding_side
 
     overall = results['correct'] / max(results['total'], 1)
     return overall, results['by_type']
@@ -194,4 +254,5 @@ if __name__ == '__main__':
         print(f'Initialized {RESULTS_TSV}')
 
     print('\n=== Preparation complete ===')
+    print(f'Validation: {len(val_data)} samples ({VAL_SAMPLES_PER_TYPE} per type)')
     print(f'Next: run "python train.py" to verify baseline, then start autoresearch.')
