@@ -10,16 +10,26 @@ Autonomous SFT optimization using the [autoresearch](https://github.com/karpathy
 mkdir -p data
 cp /path/to/train.csv data/
 
-# 3. Install dependencies
-pip install torch transformers accelerate peft trl datasets polars mamba_ssm causal_conv1d sentencepiece
+# 3. Install PyTorch matching your CUDA version (check with: nvcc --version)
+pip install torch --index-url https://download.pytorch.org/whl/cu128  # adjust cu128 to match your CUDA
 
-# 4. Run one-time preparation
+# 4. Install mamba_ssm and causal_conv1d (must use --no-build-isolation to avoid CUDA mismatch)
+pip install mamba_ssm --no-build-isolation
+pip install causal_conv1d --no-build-isolation
+
+# 5. Install remaining dependencies
+pip install transformers accelerate peft trl datasets polars sentencepiece
+
+# 6. Verify packages installed correctly
+python check_install.py
+
+# 7. Run one-time preparation
 python prepare.py
 
-# 5. Verify baseline works
+# 8. Verify baseline works
 python train.py
 
-# 6. Initialize git (autoresearch uses git to track experiments)
+# 9. Initialize git (autoresearch uses git to track experiments)
 git init
 git add -A
 git commit -m "initial baseline"
